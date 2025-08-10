@@ -1,1 +1,5 @@
-RPi.GPIO
+RPi.GPIO==0.7.1
+adafruit-blinka==8.62.0
+adafruit-circuitpython-busdevice==5.2.13
+adafruit-circuitpython-charlcd==3.5.3
+adafruit-circuitpython-ahtx0==1.0.27
