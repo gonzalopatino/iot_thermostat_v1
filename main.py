@@ -100,8 +100,15 @@ class App:
     # ---------- State transitions ----------
     def _enter_idle(self) -> None:
         self.state = "IDLE"
+        # Clean clear + short settle helps the HD44780 after active updates
+        try:
+            self.lcd.clear()
+            time.sleep(0.01)
+        except Exception:
+            pass
         self.lcd.show_message("Idle", "Press button")
         print("🔄 State changed -> IDLE")
+
 
     def _enter_reading(self) -> None:
         self.state = "READING"
