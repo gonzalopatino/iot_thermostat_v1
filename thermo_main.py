@@ -1,6 +1,6 @@
 # ===============================================================
-#  Thermostat – single-file, modular + documented
-#  HW: AHT20 (I2C), Buttons (MODE/UP/DOWN), LEDs (HEAT/COOL), 16x2 LCD
+#  Thermostat – single-file with MQTT (Subscribe + Publish)
+#  HW: AHT20 (I2C), Buttons MODE/UP/DOWN (BCM 18/20/21), LEDs (BCM 23/24), 16x2 LCD
 #  FSM: INIT, OFF, HEAT_IDLE, HEAT_DEMAND, COOL_IDLE, COOL_DEMAND, FAULT
 #  Behavior:
 #    - MODE cycles OFF → HEAT → COOL → OFF
@@ -10,19 +10,16 @@
 #    - LEDs: *_IDLE = solid, *_DEMAND = fade
 #    - LCD: line1=time; line2 alternates {T/RH} and {STATE/SP} every 2 s
 #    - UART CSV every 30 s to /dev/serial0 (falls back to stdout)
-#
-#  Notes:
-#    - This stays a single file but splits responsibilities into:
-#        * Thin drivers (LEDs, sensor, LCD, buttons, UART sink)
-#        * Pure FSM (no GPIO calls, easy to test)
-#        * App wiring loop (samples sensor, ticks FSM, drives drivers)
-#    - Software PWM on GPIO 23/24 is fine for a demo. For rock-solid
-#      fades, move to hardware PWM pins (GPIO18/GPIO13) later.
+#    - MQTT:
+#        * Subscribe  devices/<DEVICE_ID>/cmd
+#          - {"type":"set_mode","value":"OFF|HEAT|COOL"}
+#          - {"type":"set_sp","value":72}
+#        * Publish    devices/<DEVICE_ID>/telemetry  (JSON)
 # ===============================================================
 
 from __future__ import annotations
 
-import os, sys, time, threading, logging
+import os, sys, time, threading, logging, json, datetime
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -47,6 +44,12 @@ try:
     import serial  # pyserial (optional)
 except Exception:
     serial = None
+
+# MQTT (optional). If paho isn't installed, MQTT will be disabled automatically.
+try:
+    import paho.mqtt.client as mqtt  # type: ignore
+except Exception:
+    mqtt = None
 
 
 # =========================
@@ -81,6 +84,19 @@ LOOP_PERIOD    = 0.10
 # Buttons debounce/guard
 BOUNCETIME_MS  = 50
 PRESS_GUARD_S  = 0.18  # additional guard across ISRs
+
+# MQTT config (override with env vars if you like)
+MQTT_ENABLED    = os.getenv("MQTT_ENABLED", "1") not in ("0", "false", "False")
+MQTT_HOST       = os.getenv("MQTT_HOST", "broker.hivemq.com")   # or your broker
+MQTT_PORT       = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME   = os.getenv("MQTT_USERNAME", "") or None
+MQTT_PASSWORD   = os.getenv("MQTT_PASSWORD", "") or None
+MQTT_TLS        = os.getenv("MQTT_TLS", "0") in ("1", "true", "True")
+DEVICE_ID       = os.getenv("DEVICE_ID", "rpi-thermostat-001")
+MQTT_TOPIC_CMD  = os.getenv("MQTT_TOPIC_CMD",  f"devices/{DEVICE_ID}/cmd")
+MQTT_TOPIC_TEL  = os.getenv("MQTT_TOPIC_TEL",  f"devices/{DEVICE_ID}/telemetry")
+MQTT_KEEPALIVE  = int(os.getenv("MQTT_KEEPALIVE", "45"))
+MQTT_QOS        = int(os.getenv("MQTT_QOS", "1"))  # 0|1|2
 
 
 # =========================
@@ -117,6 +133,12 @@ class ButtonEvent:
     ts: float
 
 @dataclass(frozen=True)
+class CloudCommand:
+    type: str   # "set_mode" | "set_sp"
+    value: object
+    ts: float
+
+@dataclass(frozen=True)
 class LcdViewModel:
     line1: str
     line2: str
@@ -137,10 +159,7 @@ class StateSnapshot:
 # Thin hardware drivers
 # =========================
 class LedDriver:
-    """Simple PWM LED driver with 'solid' and 'fade' modes.
-
-    Design: caller expresses intent (solid/fade/off); this driver renders it.
-    """
+    """Simple PWM LED driver with 'solid' and 'fade' modes."""
     def __init__(self, pin: int, freq_hz: int = 400) -> None:
         GPIO.setup(pin, GPIO.OUT)
         self._pwm = GPIO.PWM(pin, freq_hz)
@@ -208,10 +227,7 @@ class LcdDriver:
 
 
 class ButtonsDriver:
-    """ISR posts ButtonEvent via provided callback.
-
-    ISR stays tiny (no I/O), just emits an event with an extra guard window.
-    """
+    """ISR posts ButtonEvent via provided callback."""
     def __init__(self, publish_cb) -> None:
         self._publish = publish_cb
         self._last_ts = 0.0
@@ -255,8 +271,112 @@ class UartSink:
         if self._ser:
             try: self._ser.write(csv.encode("utf-8")); return
             except Exception as ex: log.warning("UART write failed: %s", ex)
-        # Console fallback: format nicely (no newline since csv ends with \n)
         log.info("UART CSV  | %s", csv.strip())
+
+
+# =========================
+# MQTT client wrapper
+# =========================
+class MqttClient:
+    """Paho client wrapper: runs loop in background, passes CloudCommand
+    into a callback, and publishes telemetry snapshots as JSON."""
+    def __init__(self, on_command_cb) -> None:
+        self.enabled = bool(mqtt and MQTT_ENABLED)
+        self.on_command_cb = on_command_cb
+        self.client = None
+        if not self.enabled:
+            log.info("MQTT disabled (paho not installed or MQTT_ENABLED=0).")
+            return
+
+        cid = f"{DEVICE_ID}"
+        self.client = mqtt.Client(client_id=cid, clean_session=True)
+        if MQTT_USERNAME:
+            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        if MQTT_TLS:
+            self.client.tls_set()  # default OS CA bundle
+
+        # LWT so dashboards can show offline status
+        self.client.will_set(MQTT_TOPIC_TEL, json.dumps({"status":"offline","ts":datetime.datetime.utcnow().isoformat()}), qos=MQTT_QOS, retain=True)
+
+        # Callbacks
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+
+        # Connect & start network loop
+        try:
+            self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
+            self.client.loop_start()
+            log.info("MQTT connecting to %s:%s as %s", MQTT_HOST, MQTT_PORT, cid)
+        except Exception as ex:
+            self.enabled = False
+            log.error("MQTT connect failed: %s", ex)
+
+    # ---- callbacks ----
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            log.info("MQTT connected. Subscribing to %s (QoS=%d)", MQTT_TOPIC_CMD, MQTT_QOS)
+            try:
+                client.subscribe(MQTT_TOPIC_CMD, qos=MQTT_QOS)
+                # Advertise online state
+                client.publish(MQTT_TOPIC_TEL, json.dumps({"status":"online","ts":datetime.datetime.utcnow().isoformat()}), qos=MQTT_QOS, retain=True)
+            except Exception as ex:
+                log.error("MQTT subscribe error: %s", ex)
+        else:
+            log.error("MQTT connection failed rc=%s", rc)
+
+    def _on_disconnect(self, client, userdata, rc):
+        log.warning("MQTT disconnected (rc=%s)", rc)
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+            ctype = str(payload.get("type", "")).lower()
+            value = payload.get("value")
+            cmd = None
+            if ctype == "set_mode" and isinstance(value, str):
+                cmd = CloudCommand(type="set_mode", value=value.upper(), ts=time.monotonic())
+            elif ctype == "set_sp":
+                # accept int/float string
+                try:
+                    cmd = CloudCommand(type="set_sp", value=float(value), ts=time.monotonic())
+                except Exception:
+                    pass
+            if cmd:
+                log.info("MQTT CMD  | %s %s", cmd.type, cmd.value)
+                self.on_command_cb(cmd)
+            else:
+                log.warning("MQTT CMD  | unrecognized payload: %s", payload)
+        except Exception as ex:
+            log.error("MQTT on_message error: %s", ex)
+
+    # ---- publish telemetry ----
+    def publish_snapshot(self, s: StateSnapshot) -> None:
+        if not self.enabled or not self.client:
+            return
+        payload = {
+            "mode": s.mode.value,
+            "state": s.state.value,
+            "heat_demand": s.heat_demand,
+            "cool_demand": s.cool_demand,
+            "sp_f": round(s.sp_f, 2),
+            "temp_f": None if s.temp_f is None else round(s.temp_f, 2),
+            "rh": None if s.rh is None else round(s.rh, 2),
+            "ts": datetime.datetime.utcnow().isoformat()
+        }
+        try:
+            self.client.publish(MQTT_TOPIC_TEL, json.dumps(payload), qos=MQTT_QOS, retain=False)
+            log.debug("MQTT PUB  | %s", payload)
+        except Exception as ex:
+            log.error("MQTT publish failed: %s", ex)
+
+    def close(self) -> None:
+        if self.enabled and self.client:
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception:
+                pass
 
 
 # =========================
@@ -278,7 +398,6 @@ class ThermostatFSM:
 
     # ---- Inputs ----
     def on_sensor(self, r: SensorReading) -> None:
-        """Consume a new sensor reading and evaluate transitions."""
         self.t_f, self.rh = r.temp_f, r.rh
         log.debug("SENSOR    | T=%5.2f F  RH=%5.2f %%", self.t_f, self.rh)
 
@@ -313,10 +432,24 @@ class ThermostatFSM:
         elif ev.which == "DOWN":
             self._adjust_sp(-SP_STEP_F)
 
+    def on_cloud(self, cmd: CloudCommand) -> None:
+        """Cloud command handler (maps to same policy as buttons)."""
+        if cmd.type == "set_mode":
+            val = str(cmd.value).upper()
+            if val == "OFF":  self._enter(State.OFF)
+            elif val == "HEAT": self._enter(State.HEAT_IDLE)
+            elif val == "COOL": self._enter(State.COOL_IDLE)
+        elif cmd.type == "set_sp":
+            try:
+                target = float(cmd.value)
+                delta = target - self.sp_f
+                self._adjust_sp(delta)
+            except Exception:
+                log.warning("Bad set_sp value: %s", cmd.value)
+
     # ---- Periodic outputs ----
     def tick(self, now: float) -> tuple[str, Optional[LcdViewModel], Optional[StateSnapshot]]:
         """Return LED intent, optional LCD update, optional telemetry snapshot."""
-        # 1) LED intent from current state
         if self.state == State.OFF:            led = "off"
         elif self.state == State.HEAT_IDLE:    led = "heat_solid"
         elif self.state == State.HEAT_DEMAND:  led = "heat_fade"
@@ -324,7 +457,6 @@ class ThermostatFSM:
         elif self.state == State.COOL_DEMAND:  led = "cool_fade"
         else:                                   led = "fault_blink"
 
-        # 2) LCD view (alternates pages or forced on changes)
         vm: Optional[LcdViewModel] = None
         if now >= self._next_lcd:
             self._next_lcd = now + LCD_ALT_SEC
@@ -336,7 +468,6 @@ class ThermostatFSM:
                 l2 = f"{self.mode.value}  SP:{self.sp_f:.0f}F"
             vm = LcdViewModel(l1[:16], l2[:16])
 
-        # 3) Telemetry snapshot every UART_PERIOD seconds
         snap: Optional[StateSnapshot] = None
         if now >= self._next_uart:
             self._next_uart = now + UART_PERIOD
@@ -368,8 +499,6 @@ class ThermostatFSM:
         old = self.sp_f
         self.sp_f = max(SP_MIN_F, min(SP_MAX_F, self.sp_f + delta))
         self._next_lcd = 0.0
-
-        # Helpful debug: show thresholds and where we are now
         heat_on_at = self.sp_f - HYST_F
         cool_on_at = self.sp_f + HYST_F
         t = self.t_f
@@ -383,7 +512,7 @@ class ThermostatFSM:
 # Application wiring
 # =========================
 class App:
-    """Owns drivers, FSM, and the cooperative main loop."""
+    """Owns drivers, FSM, MQTT, and the cooperative main loop."""
 
     def __init__(self) -> None:
         log.info("Init GPIO & drivers…")
@@ -404,6 +533,9 @@ class App:
         # FSM and event sources
         self.fsm = ThermostatFSM()
         self.buttons = ButtonsDriver(lambda ev: self.fsm.on_button(ev))
+
+        # MQTT client (optional)
+        self.mqtt = MqttClient(self.fsm.on_cloud)
 
         # Sampling timer
         self._next_sample = time.monotonic()
@@ -435,6 +567,7 @@ class App:
                     self.lcd.show(vm)
                 if snap:
                     self.uart.write_snapshot(snap)
+                    self.mqtt.publish_snapshot(snap)
 
                 time.sleep(LOOP_PERIOD)
         except KeyboardInterrupt:
@@ -474,6 +607,9 @@ class App:
         except Exception: pass
         try:
             self.led_heat.cleanup(); self.led_cool.cleanup()
+        except Exception: pass
+        try:
+            self.mqtt.close()
         except Exception: pass
         GPIO.cleanup()
         log.info("GPIO cleaned up")
