@@ -1,4 +1,17 @@
 # ===============================================================
+#  Project : Embedded Systems – Final Project
+#  File    : main.py
+#  Author  : Gonzalo Patino
+#  School  : Southern New Hampshire University (SNHU)
+#  Program : Bachelor of Science in Computer Science
+#  Focus   : Embedded Systems
+#  Date    : August 2025
+#  Notes   : 
+#      - Developed as the final project for Embedded Systems course.
+#      - Includes hardware interfacing, state machine logic, 
+#        and real-time event handling.
+# ===============================================================
+#
 #  Thermostat – single-file with MQTT (Subscribe + Publish)
 #  HW: AHT20 (I2C), Buttons MODE/UP/DOWN (BCM 18/20/21), LEDs (BCM 23/24), 16x2 LCD
 #  FSM: INIT, OFF, HEAT_IDLE, HEAT_DEMAND, COOL_IDLE, COOL_DEMAND, FAULT
