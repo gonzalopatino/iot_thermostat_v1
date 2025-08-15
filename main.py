@@ -50,25 +50,38 @@ class App:
     def __init__(self) -> None:
         print("🟢 Initializing application...")
 
-        # Hardware setup
+        # Hardware Initialization
         self.lcd = LCDDisplay()
         try:
             self.sensor = AHT20Sensor(settle_s=0.2)
-            print("✅ AHT20 sensor initialized successfully.")
+            print("AHT20 sensor initialized successfully.")
         except AHT20InitError as ex:
             self.lcd.show_message("AHT20 init err", "Check wiring")
-            print(f"❌ AHT20 init error: {ex}")
+            print(f"AHT20 init error: {ex}")
             raise
 
         # Button ISR -> event flag (no logic in ISR)
         self._button_event = threading.Event()
         self._last_press_ts = 0.0
-        self.button = ButtonHandler(
+
+        self.button_mode = ButtonHandler(
             button_pin=18,
             callback=self._on_button_isr,
             bouncetime_ms=self.BOUNCETIME_MS,
         )
-        print("✅ Button handler initialized.")
+
+        self.up_button = ButtonHandler(
+            button_pin=20,
+            callback=self._on_button_isr,
+            bouncetime_ms=self.BOUNCETIME_MS,
+        )
+
+        self.down_button = ButtonHandler(
+            button_pin=21,
+            callback=self._on_button_isr,
+            bouncetime_ms=self.BOUNCETIME_MS,
+        )
+        print("Button handlers all initialized.")
 
        
 
@@ -197,7 +210,7 @@ class App:
             time.sleep(0.4)
             self.lcd.cleanup()
         finally:
-            self.button.cleanup()
+            self.button_mode.cleanup()
             print("✅ GPIO cleaned up")
 
 
