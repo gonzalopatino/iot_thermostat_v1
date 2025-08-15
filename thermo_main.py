@@ -1,143 +1,209 @@
 # ===============================================================
-#  Project: Thermostat (AHT20 + Buttons + LEDs + 16x2 LCD)
-#  States : INIT, OFF, HEAT_IDLE, HEAT_DEMAND, COOL_IDLE, COOL_DEMAND, FAULT
-#  Notes  : - BTN_MODE cycles OFF → HEAT → COOL → OFF
-#           - BTN_UP / BTN_DOWN adjust set point (SP) and re-evaluate demand
-#           - LEDs: *_IDLE = solid, *_DEMAND = fade (PWM)
-#           - LCD: L1 = time; L2 alternates between "T/RH" and "STATE, SP"
-#           - UART CSV every 30 s; prints if /dev/serial0 unavailable
+#  Thermostat – single-file, modular refactor
+#  HW: AHT20, 3 buttons, 2 LEDs, 16x2 LCD
+#  States: INIT, OFF, HEAT_IDLE, HEAT_DEMAND, COOL_IDLE, COOL_DEMAND, FAULT
+#  Buttons: MODE cycles OFF→HEAT→COOL→OFF; UP/DOWN adjust SP and re-evaluate
+#  LCD: L1 time; L2 alternates T/RH and STATE/SP every 2 s
+#  UART: CSV every 30 s to /dev/serial0 (falls back to print)
+#  Notes: LEDs are on BCM 23/24 -> software PWM via RPi.GPIO (OK for demo).
+#         For rock-solid fades, consider BCM 18/13 (hardware PWM) later.
 # ===============================================================
 
 from __future__ import annotations
 
-import os, sys, time, math, threading
-from typing import Callable, Dict, Optional
+import os, sys, time, threading
+from typing import Optional, Callable, Dict
+from dataclasses import dataclass
+from enum import Enum
 
-# Make ./src importable
+# Make ./src importable (uses your existing files)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
-
-from aht20_sensor import AHT20Sensor, AHT20InitError     # type: ignore
-from button_handler import ButtonHandler                  # type: ignore
-from lcd_display import LCDDisplay                        # type: ignore
+from aht20_sensor import AHT20Sensor, AHT20InitError  # type: ignore
+from button_handler import ButtonHandler                # type: ignore
+from lcd_display import LCDDisplay                      # type: ignore
 
 import RPi.GPIO as GPIO
 try:
-    import serial   # pyserial
+    import serial  # pyserial
 except Exception:
-    serial = None   # fallback to print
+    serial = None
 
-# ---------------- Pin plan (BCM) ----------------
-PIN_BTN_MODE  = 18
-PIN_BTN_UP    = 20
-PIN_BTN_DOWN  = 21
-PIN_LED_HEAT  = 23   # PWM0-capable
-PIN_LED_COOL  = 24   # PWM1-capable
+
+# ------------------------- Config -------------------------
+
+# Buttons (BCM)
+PIN_BTN_MODE = 18
+PIN_BTN_UP   = 20
+PIN_BTN_DOWN = 21
+
+# LEDs (BCM) — these pins use software PWM in RPi.GPIO
+PIN_LED_HEAT = 23
+PIN_LED_COOL = 24
+
+# Thermostat tuning
+HYST_F         = 1.0
+SP_MIN_F       = 50.0
+SP_MAX_F       = 86.0
+DEFAULT_SP_F   = 72.0
+
+# Sensor sampling / averaging
+SENSOR_HZ      = 1.0
+AVG_SAMPLES    = 3
+AVG_INTERVAL_S = 0.12
+
+# UI / cadence
+LCD_ALT_SEC    = 2.0
+UART_PERIOD    = 30.0
+LOOP_PERIOD    = 0.10
+
+# Buttons debounce/guard
+BOUNCETIME_MS  = 50
+PRESS_GUARD_S  = 0.18
+
+
+# ------------------------- Types -------------------------
+
+class Mode(str, Enum):
+    OFF = "OFF"
+    HEAT = "HEAT"
+    COOL = "COOL"
+
+class State(str, Enum):
+    INIT = "INIT"
+    OFF = "OFF"
+    HEAT_IDLE = "HEAT_IDLE"
+    HEAT_DEMAND = "HEAT_DEMAND"
+    COOL_IDLE = "COOL_IDLE"
+    COOL_DEMAND = "COOL_DEMAND"
+    FAULT = "FAULT"
+
+@dataclass(frozen=True)
+class SensorReading:
+    temp_f: float
+    rh: float
+    ts: float
+
+@dataclass(frozen=True)
+class SensorError:
+    message: str
+    ts: float
+
+@dataclass(frozen=True)
+class ButtonEvent:
+    which: str  # "MODE" | "UP" | "DOWN"
+    ts: float
+
+@dataclass(frozen=True)
+class LcdViewModel:
+    line1: str
+    line2: str
+
+@dataclass(frozen=True)
+class StateSnapshot:
+    mode: Mode
+    state: State
+    sp_f: float
+    temp_f: Optional[float]
+    rh: Optional[float]
+    heat_demand: bool
+    cool_demand: bool
+    ts: float
+
+
+# ------------------------- Drivers (thin) -------------------------
 
 class LedDriver:
-    """Tiny PWM LED driver: solid, fade, off."""
+    """Simple PWM LED driver with solid and fade. Software PWM is fine for a demo."""
     def __init__(self, pin: int, freq_hz: int = 400) -> None:
         GPIO.setup(pin, GPIO.OUT)
-        self.pin = pin
-        self.pwm = GPIO.PWM(pin, freq_hz)
-        self.pwm.start(0.0)  # duty 0..100
-        self.mode = "off"
+        self._pwm = GPIO.PWM(pin, freq_hz)
+        self._pwm.start(0.0)
+        self._fade = False
 
-    def solid(self, duty: float = 40.0) -> None:
-        self.mode = "solid"
-        self.pwm.ChangeDutyCycle(max(0.0, min(100.0, duty)))
+    def solid(self, duty_pct: float = 40.0) -> None:
+        self._fade = False
+        self._pwm.ChangeDutyCycle(max(0.0, min(100.0, duty_pct)))
 
-    def fade(self, t: float, period: float = 1.8, min_dc: float = 10.0, max_dc: float = 80.0) -> None:
-        self.mode = "fade"
-        # nice slow triangle
-        phase = (t % period) / period
+    def fade_tick(self) -> None:
+        """Call periodically to animate a breathing effect if fade is enabled."""
+        if not self._fade:
+            return
+        t = time.monotonic()
+        # triangle wave 0..1..0 over ~1.8 s
+        phase = (t % 1.8) / 1.8
         tri = 2.0 * (0.5 - abs(phase - 0.5))  # 0..1..0
-        dc = min_dc + (max_dc - min_dc) * tri
-        self.pwm.ChangeDutyCycle(dc)
+        duty = 10.0 + (80.0 - 10.0) * tri
+        self._pwm.ChangeDutyCycle(duty)
+
+    def set_fade(self, enable: bool = True) -> None:
+        self._fade = enable
+        if not enable:
+            self._pwm.ChangeDutyCycle(0.0)
 
     def off(self) -> None:
-        self.mode = "off"
-        self.pwm.ChangeDutyCycle(0.0)
+        self._fade = False
+        self._pwm.ChangeDutyCycle(0.0)
 
     def cleanup(self) -> None:
-        try: self.pwm.stop()
+        try: self._pwm.stop()
         except Exception: pass
 
 
-class App:
-    # ---------- Tunables ----------
-    HYST_F: float = 1.0                 # hysteresis (Fahrenheit)
-    SP_MIN_F: float = 50.0
-    SP_MAX_F: float = 86.0
-    DEFAULT_SP_F: float = 72.0
-
-    SENSOR_HZ: float = 1.0              # sample rate
-    AVG_SAMPLES: int = 3
-    AVG_INTERVAL_S: float = 0.12
-
-    LOOP_PERIOD: float = 0.10
-    LCD_ALT_SEC: float = 2.0
-    UART_PERIOD: float = 30.0
-
-    PRESS_GUARD: float = 0.18           # ISR global guard
-    BOUNCETIME_MS: int = 50             # hardware debounce in ISR
-
+class SensorDriver:
+    """Serialized AHT20 access with averaging."""
     def __init__(self) -> None:
-        print("🟢 Initializing application...")
-        GPIO.setmode(GPIO.BCM)
+        self._lock = threading.Lock()
+        self._sensor = AHT20Sensor(settle_s=0.2)
 
-        # LCD + Sensor
-        self.lcd = LCDDisplay()
-        try:
-            self.sensor = AHT20Sensor(settle_s=0.2)
-            print("AHT20 sensor initialized successfully.")
-        except AHT20InitError as ex:
-            self._fatal("AHT20 init err", str(ex))
+    def read(self) -> SensorReading:
+        with self._lock:
+            r = self._sensor.read_avg(samples=AVG_SAMPLES, interval_s=AVG_INTERVAL_S)
+        t_f = r.temperature_c * 9.0 / 5.0 + 32.0
+        return SensorReading(temp_f=t_f, rh=r.humidity_rh, ts=time.monotonic())
 
-        # LED PWM drivers
-        self.led_heat = LedDriver(PIN_LED_HEAT)
-        self.led_cool = LedDriver(PIN_LED_COOL)
 
-        # --- Buttons: ISR only sets events ---
-        self._ev_mode  = threading.Event()
-        self._ev_up    = threading.Event()
-        self._ev_down  = threading.Event()
-        self._last_press_ts = 0.0
+class LcdDriver:
+    def __init__(self) -> None:
+        self._lcd = LCDDisplay()
+        self._last: tuple[str, str] | None = None
 
-        self.btn_mode = ButtonHandler(PIN_BTN_MODE,  self._mk_isr(self._ev_mode),  bouncetime_ms=self.BOUNCETIME_MS)
-        self.btn_up   = ButtonHandler(PIN_BTN_UP,    self._mk_isr(self._ev_up),    bouncetime_ms=self.BOUNCETIME_MS)
-        self.btn_down = ButtonHandler(PIN_BTN_DOWN,  self._mk_isr(self._ev_down),  bouncetime_ms=self.BOUNCETIME_MS)
+    def show(self, vm: LcdViewModel) -> None:
+        pair = (vm.line1, vm.line2)
+        if pair != self._last:
+            self._lcd.show_message(vm.line1, vm.line2)
+            self._last = pair
 
-        # --- State variables ---
-        self.state: str = "INIT"
-        self.mode: str = "OFF"          # visible mode: OFF|HEAT|COOL
-        self.SP_f: float = self.DEFAULT_SP_F
-        self.T_f: Optional[float] = None
-        self.RH: Optional[float] = None
-        self.heat_demand: bool = False
-        self.cool_demand: bool = False
+    def show_fault(self) -> None:
+        self._lcd.show_message("FAULT", "Sensor error")
 
-        # timers
-        now = time.monotonic()
-        self._next_sample = now
-        self._next_lcd = now
-        self._lcd_page = 0              # 0: T/RH, 1: STATE/SP
-        self._next_uart = now + self.UART_PERIOD
+    def cleanup(self) -> None:
+        self._lcd.cleanup()
 
-        # locks
-        self._i2c_lock = threading.Lock()
 
-        # dispatch
-        self._handlers: Dict[str, Callable[[], None]] = {
-            "INIT": self._state_init,
-            "OFF": self._state_off,
-            "HEAT_IDLE": self._state_heat_idle,
-            "HEAT_DEMAND": self._state_heat_demand,
-            "COOL_IDLE": self._state_cool_idle,
-            "COOL_DEMAND": self._state_cool_demand,
-            "FAULT": self._state_fault,
-        }
+class ButtonsDriver:
+    """ISR posts ButtonEvent via provided callback."""
+    def __init__(self, publish: Callable[[ButtonEvent], None]) -> None:
+        self._publish = publish
+        self._last_ts = 0.0
+        self._mk(PIN_BTN_MODE, "MODE")
+        self._mk(PIN_BTN_UP,   "UP")
+        self._mk(PIN_BTN_DOWN, "DOWN")
 
-        # UART (optional)
+    def _mk(self, pin: int, name: str) -> None:
+        def isr():
+            now = time.monotonic()
+            if now - self._last_ts >= PRESS_GUARD_S:
+                self._last_ts = now
+                self._publish(ButtonEvent(which=name, ts=now))
+        ButtonHandler(pin, isr, bouncetime_ms=BOUNCETIME_MS)
+
+    def cleanup(self) -> None:
+        pass
+
+
+class UartSink:
+    """Write CSV snapshots to /dev/serial0 or print."""
+    def __init__(self) -> None:
         self._ser = None
         if serial:
             try:
@@ -145,235 +211,213 @@ class App:
             except Exception:
                 self._ser = None
 
-    # --------- ISR helpers ---------
-    def _mk_isr(self, ev: threading.Event):
-        def _isr():
-            now = time.monotonic()
-            if now - self._last_press_ts >= self.PRESS_GUARD:
-                self._last_press_ts = now
-                ev.set()
-        return _isr
-
-    # --------- States ---------
-    def _state_init(self) -> None:
-        # First good sensor read → OFF; else FAULT
-        if self._maybe_sample():
-            if self.T_f is not None:
-                self._enter_off()
-
-    def _state_off(self) -> None:
-        self.mode = "OFF"
-        self.led_heat.off(); self.led_cool.off()
-        self._lcd_if_due()
-        self._uart_if_due()
-
-        # mode cycle
-        if self._take(self._ev_mode):
-            self._enter_heat_idle()
-
-        # SP adjustments still allowed while OFF
-        if self._take(self._ev_up):   self._adjust_sp(+1)
-        if self._take(self._ev_down): self._adjust_sp(-1)
-
-        self._maybe_sample()  # keep current T/RH fresh for display
-
-    def _state_heat_idle(self) -> None:
-        self.mode = "HEAT"
-        self.led_heat.solid(); self.led_cool.off()
-        self._common_operational()
-
-        # demand evaluation
-        if self.T_f is not None and self.T_f <= self.SP_f - self.HYST_F:
-            self._enter_heat_demand()
-
-    def _state_heat_demand(self) -> None:
-        self.mode = "HEAT"
-        self.led_heat.fade(time.monotonic()); self.led_cool.off()
-        self._common_operational()
-
-        if self.T_f is not None and self.T_f >= self.SP_f:
-            self._enter_heat_idle()
-
-    def _state_cool_idle(self) -> None:
-        self.mode = "COOL"
-        self.led_cool.solid(); self.led_heat.off()
-        self._common_operational()
-
-        if self.T_f is not None and self.T_f >= self.SP_f + self.HYST_F:
-            self._enter_cool_demand()
-
-    def _state_cool_demand(self) -> None:
-        self.mode = "COOL"
-        self.led_cool.fade(time.monotonic()); self.led_heat.off()
-        self._common_operational()
-
-        if self.T_f is not None and self.T_f <= self.SP_f:
-            self._enter_cool_idle()
-
-    def _state_fault(self) -> None:
-        # Blink both LEDs slowly; show FAULT
-        t = time.monotonic()
-        if int(t * 2) % 2 == 0:
-            self.led_heat.solid(40); self.led_cool.off()
-        else:
-            self.led_cool.solid(40); self.led_heat.off()
-        self.lcd.show_message("FAULT", "Sensor error")
-        # allow retry by pressing MODE
-        if self._take(self._ev_mode):
-            self._enter_off()
-
-    # --------- Common helpers ---------
-    def _common_operational(self) -> None:
-        """Read buttons, sensor, lcd, uart in HEAT/COOL."""
-        # Mode cycle
-        if self._take(self._ev_mode):
-            if self.state.startswith("HEAT"):
-                self._enter_cool_idle()
-            elif self.state.startswith("COOL"):
-                self._enter_off()
-            return
-
-        # SP adjust then immediately re-evaluate demand
-        sp_changed = False
-        if self._take(self._ev_up):   sp_changed = self._adjust_sp(+1) or sp_changed
-        if self._take(self._ev_down): sp_changed = self._adjust_sp(-1) or sp_changed
-
-        self._maybe_sample()
-
-        # If SP changed, force LCD refresh
-        if sp_changed:
-            self._next_lcd = 0.0
-
-        self._lcd_if_due()
-        self._uart_if_due()
-
-    def _lcd_if_due(self) -> None:
-        now = time.monotonic()
-        if now < self._next_lcd:
-            return
-        self._next_lcd = now + self.LCD_ALT_SEC
-        self._lcd_page ^= 1
-
-        line1 = time.strftime("%m/%d %H:%M:%S")
-        if self._lcd_page == 0 and self.T_f is not None and self.RH is not None:
-            line2 = f"T:{self.T_f:4.1f}F RH:{self.RH:4.1f}%"
-        else:
-            line2 = f"{self.mode}  SP:{self.SP_f:.0f}F"
-        self.lcd.show_message(line1[:16], line2[:16])
-
-    def _uart_if_due(self) -> None:
-        now = time.monotonic()
-        if now < self._next_uart:
-            return
-        self._next_uart = now + self.UART_PERIOD
-        # Build snapshot
-        heat = self.state.startswith("HEAT")
-        cool = self.state.startswith("COOL")
-        heat_dem = self.state == "HEAT_DEMAND"
-        cool_dem = self.state == "COOL_DEMAND"
-        temp = f"{self.T_f:.2f}" if self.T_f is not None else "nan"
-        rh   = f"{self.RH:.2f}" if self.RH is not None else "nan"
-        csv = f"{self.mode},{'1' if heat_dem else '0'},{'1' if cool_dem else '0'},{temp},{rh},{self.SP_f:.2f}\n"
+    def write_snapshot(self, s: StateSnapshot) -> None:
+        csv = f"{s.mode.value},{int(s.heat_demand)},{int(s.cool_demand)},{s.temp_f if s.temp_f is not None else 'nan'},{s.rh if s.rh is not None else 'nan'},{s.sp_f:.2f}\n"
         if self._ser:
-            try: self._ser.write(csv.encode("utf-8"))
-            except Exception: print(csv, end="")
+            try:
+                self._ser.write(csv.encode("utf-8")); return
+            except Exception:
+                pass
+        print(csv, end="")
+
+
+# ------------------------- FSM (pure logic) -------------------------
+
+class ThermostatFSM:
+    """Pure thermostat logic: no GPIO here."""
+    def __init__(self) -> None:
+        self.state: State = State.INIT
+        self.mode: Mode = Mode.OFF
+        self.sp_f: float = DEFAULT_SP_F
+        self.t_f: Optional[float] = None
+        self.rh: Optional[float] = None
+
+        self._next_lcd: float = 0.0
+        self._lcd_page: int = 0
+        self._next_uart: float = time.monotonic() + UART_PERIOD
+
+    # Inputs
+    def on_sensor(self, r: SensorReading) -> None:
+        self.t_f, self.rh = r.temp_f, r.rh
+        if self.state == State.INIT:
+            self._enter(State.OFF)
+            return
+        if self.state == State.HEAT_IDLE and self.t_f <= self.sp_f - HYST_F:
+            self._enter(State.HEAT_DEMAND)
+        elif self.state == State.HEAT_DEMAND and self.t_f >= self.sp_f:
+            self._enter(State.HEAT_IDLE)
+        elif self.state == State.COOL_IDLE and self.t_f >= self.sp_f + HYST_F:
+            self._enter(State.COOL_DEMAND)
+        elif self.state == State.COOL_DEMAND and self.t_f <= self.sp_f:
+            self._enter(State.COOL_IDLE)
+
+    def on_sensor_error(self, e: SensorError) -> None:
+        self._enter(State.FAULT)
+
+    def on_button(self, ev: ButtonEvent) -> None:
+        if ev.which == "MODE":
+            if self.state == State.OFF:
+                self._enter(State.HEAT_IDLE)
+            elif self.state.name.startswith("HEAT"):
+                self._enter(State.COOL_IDLE)
+            elif self.state.name.startswith("COOL"):
+                self._enter(State.OFF)
+        elif ev.which == "UP":
+            self._adjust_sp(+1.0)
+        elif ev.which == "DOWN":
+            self._adjust_sp(-1.0)
+
+    # Periodic tick: produce LED intent, LCD VM, optional snapshot
+    def tick(self, now: float) -> tuple[str, Optional[LcdViewModel], Optional[StateSnapshot]]:
+        # LED intent: "off" | "heat_solid" | "heat_fade" | "cool_solid" | "cool_fade" | "fault_blink"
+        if self.state == State.OFF:
+            led = "off"
+        elif self.state == State.HEAT_IDLE:
+            led = "heat_solid"
+        elif self.state == State.HEAT_DEMAND:
+            led = "heat_fade"
+        elif self.state == State.COOL_IDLE:
+            led = "cool_solid"
+        elif self.state == State.COOL_DEMAND:
+            led = "cool_fade"
         else:
-            print(csv, end="")
+            led = "fault_blink"
 
-    def _maybe_sample(self) -> bool:
-        """Sample sensor at SENSOR_HZ with averaging. Returns True if a read happened."""
-        now = time.monotonic()
-        if now < self._next_sample:
-            return False
-        self._next_sample = now + (1.0 / self.SENSOR_HZ)
-        if not self._i2c_lock.acquire(blocking=False):
-            return False
+        vm: Optional[LcdViewModel] = None
+        if now >= self._next_lcd:
+            self._next_lcd = now + LCD_ALT_SEC
+            self._lcd_page ^= 1
+            l1 = time.strftime("%m/%d %H:%M:%S")
+            if self._lcd_page == 0 and self.t_f is not None and self.rh is not None:
+                l2 = f"T:{self.t_f:4.1f}F RH:{self.rh:4.1f}%"
+            else:
+                l2 = f"{self.mode.value}  SP:{self.sp_f:.0f}F"
+            vm = LcdViewModel(l1[:16], l2[:16])
+
+        snap: Optional[StateSnapshot] = None
+        if now >= self._next_uart:
+            self._next_uart = now + UART_PERIOD
+            snap = StateSnapshot(
+                mode=self.mode,
+                state=self.state,
+                sp_f=self.sp_f,
+                temp_f=self.t_f,
+                rh=self.rh,
+                heat_demand=(self.state == State.HEAT_DEMAND),
+                cool_demand=(self.state == State.COOL_DEMAND),
+                ts=now,
+            )
+        return led, vm, snap
+
+    # internals
+    def _enter(self, s: State) -> None:
+        self.state = s
+        self.mode = (
+            Mode.OFF if s == State.OFF
+            else Mode.HEAT if s.name.startswith("HEAT")
+            else Mode.COOL
+        )
+        self._next_lcd = 0.0  # force refresh on state/SP changes
+
+    def _adjust_sp(self, delta: float) -> None:
+        self.sp_f = max(SP_MIN_F, min(SP_MAX_F, self.sp_f + delta))
+        self._next_lcd = 0.0
+
+
+# ------------------------- App (wires everything) -------------------------
+
+class App:
+    def __init__(self) -> None:
+        print("🟢 Init…")
+        GPIO.setmode(GPIO.BCM)
+
+        # Drivers
+        self.lcd = LcdDriver()
         try:
-            r = self.sensor.read_avg(self.AVG_SAMPLES, self.AVG_INTERVAL_S)
-            self.T_f = r.temperature_c * 9.0 / 5.0 + 32.0
-            self.RH = r.humidity_rh
-            return True
-        except Exception as ex:
-            print(f"Sensor read error: {ex}")
-            self._enter_fault()
-            return False
-        finally:
-            self._i2c_lock.release()
+            self.sensor = SensorDriver()
+        except AHT20InitError as ex:
+            self.lcd.show_fault()
+            raise
 
-    def _adjust_sp(self, delta: int) -> bool:
-        new = max(self.SP_MIN_F, min(self.SP_MAX_F, self.SP_f + float(delta)))
-        changed = (abs(new - self.SP_f) > 1e-6)
-        self.SP_f = new
-        return changed
+        self.led_heat = LedDriver(PIN_LED_HEAT)
+        self.led_cool = LedDriver(PIN_LED_COOL)
 
-    def _take(self, ev: threading.Event) -> bool:
-        if ev.is_set():
-            ev.clear()
-            return True
-        return False
+        # FSM + event wiring
+        self.fsm = ThermostatFSM()
 
-    # --------- Transitions ---------
-    def _enter_off(self) -> None:
-        self.state = "OFF"
-        self.lcd.show_message("OFF", "Mode=HEAT/COOL")
-        self.led_heat.off(); self.led_cool.off()
-        print("→ OFF")
+        # Button ISR → ButtonEvent → FSM
+        self.buttons = ButtonsDriver(lambda ev: self.fsm.on_button(ev))
 
-    def _enter_heat_idle(self) -> None:
-        self.state = "HEAT_IDLE"
-        self.led_heat.solid(); self.led_cool.off()
-        self._next_lcd = 0.0
-        print("→ HEAT_IDLE")
+        # Sampling
+        self._next_sample = time.monotonic()
 
-    def _enter_heat_demand(self) -> None:
-        self.state = "HEAT_DEMAND"
-        self._next_lcd = 0.0
-        print("→ HEAT_DEMAND")
+        # UART
+        self.uart = UartSink()
 
-    def _enter_cool_idle(self) -> None:
-        self.state = "COOL_IDLE"
-        self.led_cool.solid(); self.led_heat.off()
-        self._next_lcd = 0.0
-        print("→ COOL_IDLE")
-
-    def _enter_cool_demand(self) -> None:
-        self.state = "COOL_DEMAND"
-        self._next_lcd = 0.0
-        print("→ COOL_DEMAND")
-
-    def _enter_fault(self) -> None:
-        self.state = "FAULT"
-        print("→ FAULT")
-
-    # --------- Main loop ---------
+    # -- main loop --
     def run(self) -> None:
-        print("🚀 Thermostat running...")
+        print("🚀 Thermostat running…")
         try:
             while True:
-                handler = self._handlers.get(self.state, None)
-                if handler:
-                    handler()
-                time.sleep(self.LOOP_PERIOD)
+                now = time.monotonic()
+
+                # Sensor at fixed rate
+                if now >= self._next_sample:
+                    self._next_sample = now + (1.0 / SENSOR_HZ)
+                    try:
+                        self.fsm.on_sensor(self.sensor.read())
+                    except Exception as ex:
+                        self.fsm.on_sensor_error(SensorError(message=str(ex), ts=now))
+
+                # FSM tick → outputs
+                led_intent, vm, snap = self.fsm.tick(now)
+                self._drive_leds(led_intent, now)
+                if vm:   self.lcd.show(vm)
+                if snap: self.uart.write_snapshot(snap)
+
+                time.sleep(LOOP_PERIOD)
         except KeyboardInterrupt:
             pass
         finally:
-            self._cleanup()
+            self.cleanup()
 
-    # --------- Utilities ---------
-    def _fatal(self, l1: str, l2: str) -> None:
-        self.lcd.show_message(l1, l2)
-        raise SystemExit(l1 + " " + l2)
+    # -- outputs --
+    def _drive_leds(self, intent: str, now: float) -> None:
+        # fault blink: alternate solid red/blue at ~1 Hz
+        if intent == "off":
+            self.led_heat.off(); self.led_cool.off()
+        elif intent == "heat_solid":
+            self.led_heat.solid(40); self.led_heat.set_fade(False)
+            self.led_cool.off()
+        elif intent == "heat_fade":
+            self.led_heat.set_fade(True); self.led_cool.off()
+        elif intent == "cool_solid":
+            self.led_cool.solid(40); self.led_cool.set_fade(False)
+            self.led_heat.off()
+        elif intent == "cool_fade":
+            self.led_cool.set_fade(True); self.led_heat.off()
+        else:  # fault_blink
+            if int(now * 2) % 2 == 0:
+                self.led_heat.solid(40); self.led_cool.off()
+            else:
+                self.led_cool.solid(40); self.led_heat.off()
 
-    def _cleanup(self) -> None:
-        print("🛑 Shutting down...")
+        # run fade animation step
+        self.led_heat.fade_tick()
+        self.led_cool.fade_tick()
+
+    def cleanup(self) -> None:
+        print("🛑 Shutting down…")
         try: self.lcd.cleanup()
         except Exception: pass
         try:
-            self.btn_mode.cleanup(); self.btn_up.cleanup(); self.btn_down.cleanup()
+            self.led_heat.cleanup(); self.led_cool.cleanup()
         except Exception: pass
-        self.led_heat.cleanup(); self.led_cool.cleanup()
         GPIO.cleanup()
         print("✅ GPIO cleaned up")
+
+
+# ------------------------- Entrypoint -------------------------
 
 if __name__ == "__main__":
     App().run()
