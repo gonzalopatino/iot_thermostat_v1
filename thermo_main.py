@@ -98,6 +98,10 @@ LOOP_PERIOD    = 0.10
 BOUNCETIME_MS  = 50
 PRESS_GUARD_S  = 0.18  # additional guard across ISRs
 
+#UART
+UART_PORT = os.getenv("UART_PORT", "/dev/ttyAMA0")
+UART_BAUD = int(os.getenv("UART_BAUD", "115200"))
+
 # MQTT config (override with env vars if you like)
 MQTT_ENABLED    = os.getenv("MQTT_ENABLED", "1") not in ("0", "false", "False")
 MQTT_HOST       = os.getenv("MQTT_HOST", "broker.hivemq.com")   # or your broker
@@ -262,12 +266,13 @@ class ButtonsDriver:
 
 
 class UartSink:
+    
     """Write CSV snapshots to /dev/serial0 or log to console."""
     def __init__(self) -> None:
         self._ser = None
         if serial:
             try:
-                self._ser = serial.Serial("/dev/serial0", 115200, timeout=0)
+                self._ser = serial.Serial(UART_PORT, UART_BAUD, timeout=0)
                 log.info("UART ready at /dev/serial0 115200 8N1")
             except Exception as ex:
                 log.warning("UART unavailable (%s); logging to console", ex)

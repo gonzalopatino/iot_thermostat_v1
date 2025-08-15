@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-import serial
-import time
+import time, serial, os
 
-PORT = "/dev/serial0"   # Symbolic link to Pi’s primary UART
-BAUD = 115200
+candidates = ["/dev/ttyAMA0", "/dev/ttyS0", "/dev/serial0"]
+port = next((p for p in candidates if os.path.exists(p)), None)
+if not port:
+    raise SystemExit("No UART device found. Expected one of: " + ", ".join(candidates))
 
-try:
-    ser = serial.Serial(PORT, BAUD, timeout=1)
-    print(f"Opened {PORT} at {BAUD} baud")
-except Exception as e:
-    print(f"Failed to open UART: {e}")
-    exit(1)
-
+print(f"Opening {port} at 115200...")
+ser = serial.Serial(port, 115200, timeout=1)
 i = 0
 try:
     while True:
-        msg = f"UART test message {i}\n"
-        ser.write(msg.encode("utf-8"))
-        print(f"Sent: {msg.strip()}")
+        msg = f"UART OK {i}\n"
+        ser.write(msg.encode())
+        print("Sent:", msg.strip())
         i += 1
         time.sleep(1)
 except KeyboardInterrupt:
-    print("Exiting...")
+    pass
 finally:
     ser.close()
