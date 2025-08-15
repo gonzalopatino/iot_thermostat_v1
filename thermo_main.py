@@ -330,25 +330,43 @@ class MqttClient:
 
     def _on_message(self, client, userdata, msg):
         try:
-            payload = json.loads(msg.payload.decode("utf-8"))
+            topic = msg.topic
+            payload_str = msg.payload.decode("utf-8")
+            payload = json.loads(payload_str)
+
+            # --- ThingsBoard RPC (dashboard widgets) ---
+            # Topic: v1/devices/me/rpc/request/<reqId>
+            # Payload: {"method":"set_sp","params":73} OR {"method":"set_mode","params":"HEAT"}
+            if topic.startswith("v1/devices/me/rpc/request/"):
+                req_id = topic.split("/")[-1]
+                method = str(payload.get("method", "")).lower()
+                params = payload.get("params")
+
+                if method == "set_sp":
+                    self.on_command_cb(CloudCommand(type="set_sp", value=float(params), ts=time.monotonic()))
+                elif method == "set_mode":
+                    self.on_command_cb(CloudCommand(type="set_mode", value=str(params).upper(), ts=time.monotonic()))
+                else:
+                    log.warning("MQTT RPC  | unknown method: %s payload=%s", method, payload)
+
+                # acknowledge back to TB
+                client.publish(f"v1/devices/me/rpc/response/{req_id}", json.dumps({"ok": True}), qos=MQTT_QOS)
+                return
+
+            # --- Legacy path (if you ever use a plain broker) ---
+            # Topic: devices/<DEVICE_ID>/cmd
+            # Payload: {"type":"set_sp","value":73} or {"type":"set_mode","value":"HEAT"}
             ctype = str(payload.get("type", "")).lower()
-            value = payload.get("value")
-            cmd = None
-            if ctype == "set_mode" and isinstance(value, str):
-                cmd = CloudCommand(type="set_mode", value=value.upper(), ts=time.monotonic())
-            elif ctype == "set_sp":
-                # accept int/float string
-                try:
-                    cmd = CloudCommand(type="set_sp", value=float(value), ts=time.monotonic())
-                except Exception:
-                    pass
-            if cmd:
-                log.info("MQTT CMD  | %s %s", cmd.type, cmd.value)
-                self.on_command_cb(cmd)
+            if ctype == "set_sp":
+                self.on_command_cb(CloudCommand(type="set_sp", value=float(payload.get("value")), ts=time.monotonic()))
+            elif ctype == "set_mode":
+                self.on_command_cb(CloudCommand(type="set_mode", value=str(payload.get("value")).upper(), ts=time.monotonic()))
             else:
-                log.warning("MQTT CMD  | unrecognized payload: %s", payload)
+                log.warning("MQTT CMD  | unrecognized payload on %s: %s", topic, payload)
+
         except Exception as ex:
             log.error("MQTT on_message error: %s", ex)
+
 
     # ---- publish telemetry ----
     def publish_snapshot(self, s: StateSnapshot) -> None:
