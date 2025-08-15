@@ -70,6 +70,8 @@ class App:
         )
         print("✅ Button handler initialized.")
 
+       
+
         # State variables
         self.state: str = "IDLE"         # "IDLE" or "READING"
         self._celsius: bool = True
@@ -201,3 +203,5 @@ class App:
 
 if __name__ == "__main__":
     App().run()
+
+#new comment
