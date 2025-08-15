@@ -99,6 +99,13 @@ class App:
         self._handlers: Dict[str, Callable[[], None]] = {
             "IDLE": self._state_idle,
             "READING": self._state_reading,
+            "INIT": self._state_init,
+            "OFF": self._state_off,
+            "HEAT_IDLE": self._state_heat_idle,
+            "HEAT_DEMAND": self._state_heat_demand,
+            "COOL_IDLE": self._state_heat_idle,
+            "COOL_DEMAND": self._state_heat_idle,
+
         }
 
         # Enter initial state once
@@ -113,6 +120,17 @@ class App:
             self._button_event.set()
 
     # ---------- State transitions ----------
+    def _enter_off(self) -> None:
+        self.state = "OFF"
+        # 
+        try:
+            self.lcd.clear()
+            time.sleep(0.01)
+        except Exception:
+            pass
+        self.lcd.show_message("OFF", "Press Yellow to Toggle Heat or Cool")
+        print("🔄 State changed -> IDLE")
+        
     def _enter_idle(self) -> None:
         self.state = "IDLE"
         # Clean clear + short settle helps the HD44780 after active updates
