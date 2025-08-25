@@ -1,5 +1,94 @@
 # Raspberry Pi Thermostat (AHT20 + LCD + Buttons + LEDs + MQTT + UART)
 
+# CS350 Smart Thermostat – Final Project
+
+## Project Overview  
+This project implements a functional prototype of a smart thermostat using a Raspberry Pi, AHT20 temperature and humidity sensor, push buttons, LEDs, and a 16x2 LCD display. The thermostat solves the problem of **controlling heating and cooling systems based on a user-defined set point**. It simulates how a connected thermostat could monitor environmental conditions, switch between heating/cooling states, and communicate data via UART.  
+
+Beyond the local prototype, this project also explores the **next phase of development**: connecting the thermostat to the cloud via MQTT, enabling remote monitoring, historical trend analysis, and remote setpoint/mode changes.  
+
+---
+
+## Reflection  
+
+### 1. What did you do particularly well?  
+I did particularly well in **structuring the system around a finite state machine (FSM)**. This design choice ensured that all operational states (OFF, HEAT_IDLE, HEAT_DEMAND, COOL_IDLE, COOL_DEMAND, FAULT) were logically separated and easy to test. I also integrated the LCD, UART output, and LEDs in a consistent way that kept the system synchronized, which improved usability and debugging.  
+
+### 2. Where could you improve?  
+I could improve in **code modularization** and **error handling**. While the prototype works reliably, some of the scripts could be broken down into smaller reusable modules to increase maintainability. Additionally, UART and I²C communication could benefit from more robust exception handling and recovery routines.  
+
+### 3. What tools and/or resources are you adding to your support network?  
+I added **MQTT and TLS security standards** to my support network, learning how lightweight protocols and secure connections are critical for IoT development. I also used **datasheets, online Raspberry Pi GPIO references, and MQTT documentation** to support design decisions.  
+
+### 4. What skills from this project will be particularly transferable?  
+- **Embedded systems design with FSMs** (widely applicable to IoT and control systems).  
+- **UART communication and data formatting**, useful in debugging and device-to-device integration.  
+- **Cloud integration concepts with MQTT**, directly transferable to future IoT coursework and real-world projects.  
+- **Testing and validation strategies** (incremental builds, circuit testing with MultiButtonTest, UART verification).  
+
+### 5. How did you make this project maintainable, readable, and adaptable?  
+I ensured maintainability by:  
+- Using **consistent naming conventions** for variables, functions, and states.  
+- Documenting the system with a **System Requirements Specification (SRS)** and a **Final Report** that explains design choices.  
+- Designing the FSM so that **new states or features (like adaptive mode or Wi-Fi integration)** could be added without rewriting the core logic.  
+- Providing UART outputs in a **clear, delimited format**, making it easier for future dashboards to parse and integrate.  
+
+---
+
+## Installation and Usage  
+
+### Requirements  
+- Raspberry Pi 4 (or similar with GPIO + I²C + UART support)  
+- AHT20 temperature & humidity sensor (I²C)  
+- 3x push buttons + resistors (10kΩ pull-ups)  
+- 2x LEDs (Red & Blue) with current-limiting resistors  
+- 16x2 LCD with I²C backpack  
+- Python 3.8+  
+- Libraries: `smbus2`, `RPi.GPIO` (or `rpi-lgpio`), `Adafruit_CharLCD`, `datetime`  
+
+### Setup  
+1. Clone this repository:  
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/CS350-Thermostat.git
+   cd CS350-Thermostat
+   ```
+
+2. Install dependencies:  
+   ```bash
+   sudo apt-get install python3-smbus python3-dev
+   pip install smbus2 RPi.GPIO adafruit-circuitpython-charlcd
+   ```
+
+3. Connect hardware according to the **Lab Guide circuit diagram**.  
+
+4. Run the main thermostat program:  
+   ```bash
+   sudo python3 Thermostat.py
+   ```
+
+5. Verify UART output:  
+   ```bash
+   screen /dev/serial0 9600
+   ```
+   Output format (every 30 seconds):  
+   ```
+   state,current_temperature,set_point
+   ```
+
+---
+
+## Future Work  
+- Add **Wi-Fi and MQTT connectivity** for cloud integration.  
+- Implement **adaptive mode** for energy efficiency.  
+- Extend dashboard to include **historical trend analysis** and **remote control**.  
+
+---
+
+## License  
+This project is released under the **MIT License**.  
+
+
+
 A single-file thermostat for Raspberry Pi with:
 
 - **AHT20** temperature/humidity over **I²C**
