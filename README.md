@@ -31,7 +31,8 @@ I ensured maintainability by:
 - Using **consistent naming conventions** for variables, functions, and states.  
 - Documenting the system with a **System Requirements Specification (SRS)** and a **Final Report** that explains design choices.  
 - Designing the FSM so that **new states or features (like adaptive mode or Wi-Fi integration)** could be added without rewriting the core logic.  
-- Providing UART outputs in a **clear, delimited format**, making it easier for future dashboards to parse and integrate.  
+- Providing UART outputs in a **clear, delimited format**, making it easier for future dashboards to parse and integrate.
+- I used object-oriented programming, a modular design, component-based approach.
 
 ---
 
