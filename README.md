@@ -381,6 +381,6 @@ Buttons:
 
 ---
 
-## License
-
-MIT (or your preferred license). © You.
+## All Rights Reserved
+This project is provided for academic purposes only.  
+All rights reserved. Unauthorized use, distribution, or modification is prohibited.  
