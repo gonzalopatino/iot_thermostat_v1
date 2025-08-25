@@ -79,7 +79,6 @@ I ensured maintainability by:
 ---
 
 ## Future Work  
-- Add **Wi-Fi and MQTT connectivity** for cloud integration.  
 - Implement **adaptive mode** for energy efficiency.  
 - Extend dashboard to include **historical trend analysis** and **remote control**.  
 
