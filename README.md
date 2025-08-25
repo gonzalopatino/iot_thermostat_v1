@@ -50,7 +50,7 @@ I ensured maintainability by:
 ### Setup  
 1. Clone this repository:  
    ```bash
-   git clone https://github.com/YOUR_USERNAME/CS350-Thermostat.git
+   git clone https://github.com/YOUR_USERNAME/iot-thermostat_v1.git
    cd CS350-Thermostat
    ```
 
